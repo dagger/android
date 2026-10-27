@@ -1,0 +1,425 @@
+"""
+Build, lint, test, and sign Android Gradle projects with a containerized SDK.
+"""
+type Android {
+  """
+  Project context, including any sibling projects needed by Gradle.
+  """
+  source: Directory
+
+  """
+  Prepared source container. Takes precedence over source when provided.
+  """
+  sourceCtr: Container
+
+  """
+  Directory inside sourceCtr to use as the project context.
+  """
+  sourcePath: String!
+
+  """
+  Gradle project root relative to the context (the directory with gradlew).
+  """
+  projectPath: String!
+
+  """
+  Android API level used to choose the default SDK image.
+  """
+  compileSdk: Int!
+
+  """
+  SDK/JDK image override; empty selects ghcr.io/cirruslabs/android-sdk:<compileSdk>.
+  """
+  baseImageAddress: String!
+
+  """
+  Optional SDK/JDK container, including custom environment, secrets, or services.
+  """
+  baseCtr: Container
+
+  """
+  Build platform. The default supports Google's Linux x86_64 Android tools.
+  """
+  platform: Platform!
+
+  """
+  Gradle project selector, e.g. app or :apps:mobile. Empty selects the root project.
+  """
+  gradleModule: String!
+
+  """
+  Module directory relative to projectPath, independent of its Gradle selector.
+  """
+  modulePath: String!
+
+  """
+  Build directory relative to the Gradle root; empty uses <modulePath>/build.
+  """
+  buildDirectory: String!
+
+  """
+  Paths excluded from the context. Override to retain prebuilt dependencies when needed.
+  """
+  sourceExcludes: [String!]!
+
+  """
+  Variant used by build, lint, and test checks, including flavors (e.g. demoDebug).
+  """
+  checkVariant: String!
+
+  """
+  Gradle executable and initial arguments. Defaults to the project's wrapper via sh.
+  """
+  gradleCommand: [String!]!
+
+  """
+  Additional arguments for every Gradle invocation. Use secrets on baseCtr for credentials.
+  """
+  gradleArguments: [String!]!
+
+  """
+  Cache namespace. Change it to isolate dependency caches between projects.
+  """
+  cacheKey: String!
+
+  """
+  Exact archive entries required in every APK produced by the build check.
+  """
+  requiredApkPaths: [String!]!
+
+  new(
+    source: Directory,
+    sourceCtr: Container,
+    sourcePath: String! = ".",
+    projectPath: String! = ".",
+    compileSdk: Int! = 36,
+    baseImageAddress: String! = "",
+    baseCtr: Container,
+    platform: Platform! = "linux/amd64",
+    gradleModule: String! = "app",
+    modulePath: String! = "app",
+    buildDirectory: String! = "",
+    sourceExcludes: [String!]! = ["**/.gradle", "**/build", "**/local.properties"],
+    checkVariant: String! = "debug",
+    gradleCommand: [String!]! = ["sh", "./gradlew"],
+    gradleArguments: [String!]! = [],
+    cacheKey: String! = "android-gradle",
+    requiredApkPaths: [String!]! = [],
+  ) {
+    if (source == null and sourceCtr == null) {
+      raise "provide source or sourceCtr containing a Gradle project"
+    }
+    if (gradleCommand == []) { raise "gradleCommand must not be empty" }
+    if (checkVariant == "") { raise "checkVariant must not be empty" }
+    if (compileSdk <= 0) { raise "compileSdk must be positive" }
+    self.source = source
+    self.sourceCtr = sourceCtr
+    self.sourcePath = sourcePath
+    self.projectPath = projectPath
+    self.compileSdk = compileSdk
+    self.baseImageAddress = baseImageAddress
+    self.baseCtr = baseCtr
+    self.platform = platform
+    self.gradleModule = gradleModule
+    self.modulePath = modulePath
+    self.buildDirectory = buildDirectory
+    self.sourceExcludes = sourceExcludes
+    self.checkVariant = checkVariant
+    self.gradleCommand = gradleCommand
+    self.gradleArguments = gradleArguments
+    self.cacheKey = cacheKey
+    self.requiredApkPaths = requiredApkPaths
+    self
+  }
+
+  let context: Directory! {
+    if (sourceCtr != null) {
+      sourceCtr.directory(sourcePath)
+    } else if (source != null) { source } else { raise "provide source or sourceCtr" }
+  }
+
+  # Keep relative paths inside the mounted context; spaces are valid.
+  let relativePath(path: String!): String! {
+    if (path.hasPrefix("/") or path.split("/").contains("..")) {
+      raise `expected a relative path without '..': ${path}`
+    }
+    if (path == "" or path == ".") { "." } else { path.trimSuffix("/") }
+  }
+
+  let workdir: String! { "/project/" + relativePath(projectPath) }
+
+  let task(prefix: String!, variant: String!, suffix: String! = ""): String! {
+    if (variant == "") { raise "variant must not be empty" }
+    let first = variant.split("")[0] ?? ""
+    let name = prefix + first.toUpper + variant.trimPrefix(first) + suffix
+    let selector = gradleModule.trim(":")
+    if (selector == "") { ":" + name } else { ":" + selector + ":" + name }
+  }
+
+  let command(tasks: [String!]!, arguments: [String!]! = []): [String!]! {
+    if (tasks == []) { raise "provide at least one Gradle task" }
+    gradleCommand + ["--no-daemon"] + gradleArguments + tasks + arguments
+  }
+
+  let outputDirectory(kind: String!, outputPath: String!): String! {
+    if (outputPath != "") {
+      workdir + "/" + relativePath(outputPath)
+    } else {
+      workdir + "/" + buildPath + "/outputs/" + kind
+    }
+  }
+
+  let buildPath: String! {
+    if (buildDirectory != "") {
+      relativePath(buildDirectory)
+    } else {
+      relativePath(modulePath) + "/build"
+    }
+  }
+
+  """
+  SDK container with source and locked Gradle dependency caches. Host build
+  outputs, Gradle state, and local SDK paths are excluded from the context.
+  When baseCtr is supplied, its platform and toolchain take precedence.
+  """
+  base: Container! {
+    let ctr = if (baseCtr != null) {
+      baseCtr
+    } else {
+      let image = if (baseImageAddress != "") {
+        baseImageAddress
+      } else {
+        `ghcr.io/cirruslabs/android-sdk:${compileSdk}`
+      }
+      container(platform: platform).from(image)
+    }
+    ctr
+      .withMountedCache("/gradle/caches", cacheVolume(cacheKey + "-caches"), sharing: CacheSharingMode.LOCKED)
+      .withMountedCache("/gradle/wrapper", cacheVolume(cacheKey + "-wrapper"), sharing: CacheSharingMode.LOCKED)
+      .withEnvVariable("GRADLE_USER_HOME", "/gradle")
+      # Always discard this module's prior outputs, including custom build dirs.
+      .withDirectory(
+        "/project",
+        context.withoutDirectory(relativePath(projectPath) + "/" + buildPath),
+        exclude: sourceExcludes,
+      )
+      .withWorkdir(workdir)
+  }
+
+  """
+  Run arbitrary Gradle tasks and return the resulting container for further
+  customization or artifact/report extraction. Task names are passed verbatim.
+  """
+  run(tasks: [String!]!, arguments: [String!]! = []): Container! {
+    base.withExec(command(tasks, arguments))
+  }
+
+  """
+  Assemble a variant and return its APK output tree (including split APKs and
+  metadata). For a library, set outputPath to its AAR output directory.
+  outputPath is relative to the Gradle project root.
+  """
+  assemble(variant: String! = "debug", outputPath: String! = ""): Directory! {
+    run([task("assemble", variant)]).directory(outputDirectory("apk", outputPath))
+  }
+
+  """
+  Build an Android App Bundle variant and return its output tree. Signing, if
+  any, follows the project's Gradle configuration. outputPath is relative to
+  the Gradle project root and supports custom build directories.
+  """
+  bundle(variant: String! = "release", outputPath: String! = ""): Directory! {
+    run([task("bundle", variant)]).directory(outputDirectory("bundle", outputPath))
+  }
+
+  """
+  Assemble checkVariant and, if configured, verify exact entries in every APK.
+  """
+  build: Void @check {
+    let built = run([task("assemble", checkVariant)])
+    if (requiredApkPaths == []) {
+      built.sync
+    } else {
+      let outputs = outputDirectory("apk", "")
+      let apks = built.directory(outputs).glob("**/*.apk")
+      if (apks == []) { raise "build produced no APKs to verify" }
+      apks.map { apk =>
+        built.withExec([
+          "sh", "-eu", "-c",
+          """
+          apk=$1
+          shift
+          entries=$(mktemp)
+          trap 'rm -f "$entries"' EXIT
+          jar tf "$apk" > "$entries"
+          for entry do
+            if ! grep -F -x -- "$entry" "$entries" > /dev/null; then
+              printf 'Missing from APK %s: %s\n' "$apk" "$entry" >&2
+              exit 1
+            fi
+          done
+          """,
+
+          "verify-apk", outputs + "/" + apk,
+        ] + requiredApkPaths).sync
+      }
+    }
+    null
+  }
+
+  """
+  Run Android Lint for checkVariant. Reports remain available through run.
+  """
+  lint: Void @check {
+    run([task("lint", checkVariant)]).sync
+    null
+  }
+
+  """
+  Run all JVM unit tests directly, without collection discovery. The test check
+  is exposed through tests so selecting collection items does not also run the
+  entire suite.
+  """
+  test: Void {
+    run([task("test", checkVariant, "UnitTest")]).sync
+    null
+  }
+
+  """
+  Discover JVM test classes for checkVariant using Gradle's test dry-run mode.
+  Requires Gradle 8.3 or later. Discovery compiles test sources and loads the
+  test framework, but does not execute test bodies. Device tests are excluded.
+  """
+  tests: TestClasses! {
+    let testTask = task("test", checkVariant, "UnitTest")
+    let discovery = base
+      .withFile("/opt/dagger-android/discover-tests.gradle", currentModule.source.file("scripts/discover-tests.gradle"))
+      .withEnvVariable("DAGGER_ANDROID_TEST_TASK", testTask)
+      .withExec(command([testTask], [
+        "--init-script", "/opt/dagger-android/discover-tests.gradle",
+        "--no-configuration-cache", "--test-dry-run",
+      ]))
+    TestClasses(
+      names: discovery.file("/tmp/dagger-android-test-classes.txt").contents.split("\n").filter { name => name != "" },
+      prepared: discovery,
+      command: command([testTask]),
+    )
+  }
+
+  """
+  Build and verify signed AABs. Gradle must read ANDROID_KEYSTORE_FILE,
+  ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD.
+  Keystore bytes and passwords use Dagger secrets. Tasks always rerun with the
+  Gradle build cache disabled so previous signed outputs cannot be reused.
+  This function builds artifacts only; it does not upload or publish them.
+  """
+  signedBundle(
+    keystore: Secret!,
+    keystorePassword: Secret!,
+    keyAlias: String!,
+    keyPassword: Secret!,
+    variant: String! = "release",
+    outputPath: String! = "",
+  ): Directory! {
+    let outputs = outputDirectory("bundle", outputPath)
+    let built = base
+      .withMountedSecret("/run/signing/keystore", keystore)
+      .withEnvVariable("ANDROID_KEYSTORE_FILE", "/run/signing/keystore")
+      .withEnvVariable("ANDROID_KEY_ALIAS", keyAlias)
+      .withSecretVariable("ANDROID_KEYSTORE_PASSWORD", keystorePassword)
+      .withSecretVariable("ANDROID_KEY_PASSWORD", keyPassword)
+      .withExec(command([task("bundle", variant)], ["--rerun-tasks", "--no-build-cache"]))
+    let bundles = built.directory(outputs).glob("**/*.aab")
+    if (bundles == []) { raise "build produced no AABs to verify" }
+    bundles.map { aab =>
+      built.withExec([
+        "sh", "-eu", "-c",
+        """
+        report=$(mktemp)
+        trap 'rm -f "$report"' EXIT
+        if ! jarsigner -J-Duser.language=en -J-Duser.country=US -verify -strict \
+          -keystore "$ANDROID_KEYSTORE_FILE" -storepass:env ANDROID_KEYSTORE_PASSWORD \
+          "$1" "$ANDROID_KEY_ALIAS" > "$report" 2>&1; then
+          cat "$report" >&2
+          printf 'AAB signature verification failed: %s\n' "$1" >&2
+          exit 1
+        fi
+        if ! grep -F 'jar verified.' "$report" > /dev/null; then
+          cat "$report" >&2
+          printf 'AAB signature verification failed: %s\n' "$1" >&2
+          exit 1
+        fi
+        """,
+
+        "verify-aab", outputs + "/" + aab,
+      ]).sync
+    }
+    built.directory(outputs)
+  }
+}
+
+"""
+JVM test classes discovered by Gradle for the configured Android variant.
+"""
+type TestClasses @collection {
+  """
+  Fully qualified test class names, sorted and deduplicated.
+  """
+  names: [String!]! @keys
+
+  """
+  Changes to the discovered selection.
+  """
+  delta: CollectionDelta
+
+  let prepared: Container!
+  let command: [String!]!
+
+  """
+  Select one test class.
+  """
+  testClass(name: String!): TestClass! @get {
+    TestClass(name: name, prepared: prepared, command: command)
+  }
+
+  """
+  Run selected test classes in one Gradle invocation, reusing compiled tests.
+  An unchanged selection runs the whole suite with Gradle's own configuration.
+  """
+  test: Void @check {
+    if (names != []) {
+      let whole = if (delta == null) {
+        false
+      } else {
+        delta.addedKeys.length == 0 and delta.removedKeys.length == 0
+      }
+      let empty: [String!]! = []
+      let filters = if (whole) { empty } else {
+        names.reduce(empty) { args, name => args + ["--tests", name] }
+      }
+      prepared.withExec(command + filters + ["--no-test-dry-run"]).sync
+    }
+    null
+  }
+}
+
+"""
+A JVM test class, including its parameterized cases and inherited tests.
+"""
+type TestClass {
+  """
+  Fully qualified test class name.
+  """
+  name: String!
+
+  let prepared: Container!
+  let command: [String!]!
+
+  """
+  Run this class using Gradle's test filter, reusing compiled tests.
+  """
+  test: Void @check {
+    prepared.withExec(command + ["--tests", name, "--no-test-dry-run"]).sync
+    null
+  }
+}

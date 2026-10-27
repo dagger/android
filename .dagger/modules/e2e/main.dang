@@ -1,0 +1,351 @@
+"""
+End-to-end checks for the Android toolchain.
+"""
+type E2e {
+  let assert(ok: Boolean!, message: String!): Void {
+    if (ok == false) { raise message }
+    null
+  }
+
+  let runCheck(check: Check!): Void {
+    if (check.pass == false) { raise check.error.message ?? "check failed" }
+    null
+  }
+
+  let jdk: Container! { container.from("eclipse-temurin:21-jdk") }
+
+  let androidFixture: Directory! {
+    currentModule.source.directory("testdata/android")
+  }
+
+  let jvmFixture: Directory! { currentModule.source.directory("testdata/jvm") }
+
+  """
+  Generate the test fixture's standard Gradle wrapper from the official distribution.
+  """
+  wrapper: Directory! {
+    container
+      .from("gradle:8.13-jdk21")
+      .withWorkdir("/wrapper")
+      .withNewFile("settings.gradle", "")
+      .withExec(["gradle", "wrapper", "--gradle-version=8.13", "--no-daemon"])
+      .directory("/wrapper")
+      .withoutDirectory(".gradle")
+      .withoutFile("settings.gradle")
+  }
+
+  """
+  Build flavored APKs and AABs, lint, and run JVM tests with the real Android SDK.
+  """
+  integration: Void @check {
+    let project = android(
+      source: androidFixture,
+      gradleModule: "client",
+      modulePath: "apps/client",
+      checkVariant: "demoDebug",
+      cacheKey: "android-integration",
+      requiredApkPaths: ["assets/fixture.txt"],
+    )
+    runCheck(project.build)
+    runCheck(project.lint)
+    project.test
+    assert(project.bundle("demoRelease").glob("**/*.aab").length == 1, "release bundle missing")
+    null
+  }
+
+  """
+  Discover and select Android JUnit 4 test classes, including parameterized cases.
+  """
+  androidCollections: Void @check {
+    let project = android(
+      source: androidFixture,
+      gradleModule: "client",
+      modulePath: "apps/client",
+      checkVariant: "demoDebug",
+      cacheKey: "android-integration",
+    )
+    let classes = project.tests
+    assert(
+      classes.keys == ["com.example.fixture.ArithmeticTest", "com.example.fixture.ParameterizedTest"],
+      "unexpected Android test classes: " + classes.keys.join(", "),
+    )
+    runCheck(classes.get(key: "com.example.fixture.ParameterizedTest").test)
+    null
+  }
+
+  """
+  JUnit 5 discovery skips test bodies; individual, subset, whole, and empty selections work.
+  """
+  jvmCollections: Void @check {
+    let source = jvmFixture
+    let jdk = container.from("gradle:8.13-jdk21")
+    let project = android(
+      source: source,
+      baseCtr: jdk,
+      gradleCommand: ["gradle"],
+      gradleModule: "",
+      modulePath: ".",
+      cacheKey: "android-jvm-collections",
+    )
+    let classes = project.tests
+    assert(
+      classes.keys == ["com.example.CasesTest", "com.example.FailingTest", "com.example.InheritedTest", "com.example.PassingTest"],
+      "unexpected JUnit 5 test classes: " + classes.keys.join(", "),
+    )
+    runCheck(classes.get(key: "com.example.PassingTest").test)
+    runCheck(classes.subset(keys: ["com.example.PassingTest", "com.example.CasesTest", "com.example.InheritedTest"]).batch.test)
+    assert(classes.get(key: "com.example.FailingTest").test.pass == false, "selected failing test did not execute")
+    assert(classes.batch.test.pass == false, "whole selection missed the failing test")
+    runCheck(classes.subset(keys: []).batch.test)
+
+    let empty = android(
+      source: source.withoutDirectory("src/test"),
+      baseCtr: jdk,
+      gradleCommand: ["gradle"],
+      gradleModule: "",
+      modulePath: ".",
+      cacheKey: "android-jvm-collections",
+    ).tests
+    assert(empty.keys == [], "an empty project reported tests")
+    runCheck(empty.batch.test)
+    null
+  }
+
+  """
+  Create a disposable test keystore. This is never a production signing key.
+  """
+  testKeystore: File! {
+    jdk.withExec([
+      "keytool", "-genkeypair", "-noprompt", "-keystore", "/tmp/test.p12",
+      "-storetype", "PKCS12", "-storepass", "fixture-password", "-keypass", "fixture-password",
+      "-alias", "fixture", "-keyalg", "RSA", "-keysize", "2048",
+      "-validity", "3650", "-dname", "CN=Module Fixture",
+    ]).file("/tmp/test.p12")
+  }
+
+  """
+  Exercise real AAB signing, unsigned rejection, and invalid credentials using a disposable key.
+  """
+  signing(keystore: Secret!): Void {
+    let password = setSecret("android-fixture-password", "fixture-password")
+    let project = android(
+      source: androidFixture,
+      gradleModule: "client",
+      modulePath: "apps/client",
+      cacheKey: "android-integration",
+    )
+    let bundles = project.signedBundle(
+      keystore,
+      password,
+      "fixture",
+      password,
+      variant: "demoRelease",
+    )
+    assert(bundles.glob("**/*.aab").length == 1, "signed bundle missing")
+    let invalid = {
+      project.signedBundle(keystore, password, "nonexistent", password, variant: "demoRelease").sync
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(invalid != "passed", "invalid signing alias reused a cached bundle")
+    let wrongPassword = setSecret("android-fixture-wrong-password", "incorrect-password")
+    let invalidPassword = {
+      project.signedBundle(keystore, wrongPassword, "fixture", password, variant: "demoRelease").sync
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(invalidPassword != "passed", "invalid signing password reused a cached bundle")
+    let unsigned = android(
+      source: source,
+      projectPath: "android project",
+      baseCtr: jdk,
+      gradleModule: "apps:client",
+      modulePath: "client",
+      gradleArguments: [],
+    )
+    assert(unsigned.bundle("demoRelease").glob("**/*.aab").length == 1, "unsigned fixture did not build")
+    let rejected = {
+      unsigned.signedBundle(keystore, password, "fixture", password, variant: "demoRelease").sync
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(rejected != "passed", "unsigned AAB was accepted")
+    null
+  }
+
+  # A small stand-in for Gradle tests argument handling and artifact selection
+  # without downloading the Android SDK. integration uses the real toolchain.
+  let source: Directory! {
+    directory
+      .withNewFile("sibling/marker", "prepared context")
+      .withNewFile("android project/local.properties", "sdk.dir=/invalid/host/path")
+      .withNewFile("android project/client/build/stale", "must not be imported")
+      .withNewFile("android project/gradlew", """
+        #!/bin/sh
+        set -eu
+        test "$(cat ../sibling/marker)" = 'prepared context'
+        test ! -e local.properties
+        test ! -e client/build/stale
+        printf '%s\n' "$@" > arguments.txt
+        for arg do
+          case "$arg" in
+            :apps:client:assembleDemoDebug)
+              mkdir -p payload/assets client/build/outputs/apk/demo/debug
+              printf hello > 'payload/assets/a [1].txt'
+              jar cf 'client/build/outputs/apk/demo/debug/custom name.apk' -C payload .
+              cp 'client/build/outputs/apk/demo/debug/custom name.apk' client/build/outputs/apk/demo/debug/split.apk
+              ;;
+            :apps:client:bundleDemoRelease)
+              mkdir -p payload client/build/outputs/bundle/demoRelease
+              printf hello > payload/content
+              jar cf client/build/outputs/bundle/demoRelease/custom.aab -C payload .
+              ;;
+            :apps:client:lintDemoDebug|:apps:client:testDemoDebugUnitTest|:tasks|--no-daemon|-Pmessage=hello\ world|--stacktrace|--rerun-tasks|--no-build-cache) ;;
+            *) printf 'Unexpected argument: %s\n' "$arg" >&2; exit 1 ;;
+          esac
+        done
+      """)
+  }
+
+  let tool: Android! {
+    android(
+      source: source,
+      projectPath: "android project",
+      baseCtr: jdk,
+      gradleModule: ":apps:client",
+      modulePath: "client",
+      checkVariant: "demoDebug",
+      gradleArguments: ["-Pmessage=hello world"],
+      requiredApkPaths: ["assets/a [1].txt"],
+    )
+  }
+
+  """
+  Nested source, module selectors, flavored variants, split outputs, and exact APK entries.
+  """
+  orchestration: Void @check {
+    runCheck(tool.build)
+    runCheck(tool.lint)
+    tool.test
+    let apks = tool.assemble("demoDebug").glob("**/*.apk")
+    assert(apks.length == 2, "split APKs were not returned")
+    assert(apks.contains("demo/debug/custom name.apk"), "custom APK name was lost")
+    let bundles = tool.bundle("demoRelease").glob("**/*.aab")
+    assert(bundles == ["demoRelease/custom.aab"], "custom AAB name was lost")
+    let args = tool.run([":tasks"], ["--stacktrace"]).file("arguments.txt").contents
+    assert(
+      args == "--no-daemon\n-Pmessage=hello world\n:tasks\n--stacktrace\n",
+      "arguments were split or reordered",
+    )
+    null
+  }
+
+  """
+  Prepared containers preserve sibling context and override direct source.
+  """
+  preparedSource: Void @check {
+    let ctr = jdk.withDirectory("/prepared", source)
+    let prepared = android(
+      source: directory.withNewFile("wrong", "ignored"),
+      sourceCtr: ctr,
+      sourcePath: "/prepared",
+      projectPath: "android project",
+      baseCtr: jdk,
+      gradleModule: ":apps:client",
+      modulePath: "client",
+    )
+    assert(prepared.assemble("demoDebug").glob("**/*.apk").length == 2, "prepared context failed")
+    let root = android(
+      source: directory,
+      baseCtr: jdk,
+      gradleModule: "",
+      modulePath: ".",
+      gradleCommand: ["printf", "%s\n"],
+    )
+    assert(root.run([":tasks"]).stdout == "--no-daemon\n:tasks\n", "custom command failed")
+    runCheck(root.lint)
+    null
+  }
+
+  """
+  Missing APK entries and invalid input fail instead of silently passing.
+  """
+  failures: Void @check {
+    let missing = android(
+      source: source,
+      projectPath: "android project",
+      baseCtr: jdk,
+      gradleModule: "apps:client",
+      modulePath: "client",
+      checkVariant: "demoDebug",
+      requiredApkPaths: ["assets/a .1..txt"],
+    )
+    assert(missing.build.pass == false, "APK entries were matched as regular expressions")
+    let injected = android(
+      source: source,
+      projectPath: "android project",
+      baseCtr: jdk,
+      gradleModule: "apps:client",
+      modulePath: "client",
+      checkVariant: "demoDebug",
+      requiredApkPaths: ["'; exit 0; #"],
+    )
+    assert(injected.build.pass == false, "APK entry was executed as shell code")
+    let error = {
+      android(source: source, projectPath: "../outside", baseCtr: jdk).base.sync
+      "passed"
+    } rescue {
+      err: Error => err.message
+    }
+    assert(error.contains("relative path"), "escaping project path was accepted: " + error)
+    let empty = { tool.run([]).sync; "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(empty.contains("at least one"), "empty task list was accepted")
+    let noSource = { android.base.sync; "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(noSource.contains("provide source"), "missing source was accepted")
+    let noVariant = { tool.assemble("").sync; "passed" } rescue {
+      err: Error => err.message
+    }
+    assert(noVariant.contains("variant must not be empty"), "empty variant was accepted")
+    null
+  }
+
+  """
+  Custom build directories, artifact paths, and source exclusions remain configurable.
+  """
+  customLayout: Void @check {
+    let src = directory
+      .withNewFile("dependency/build/marker", "retained")
+      .withNewFile("custom outputs/outputs/apk/stale.apk", "stale output")
+      .withNewFile("gradlew", """
+        #!/bin/sh
+        set -eu
+        test "$(cat dependency/build/marker)" = retained
+        mkdir -p 'custom outputs/outputs/apk' payload/assets
+        printf hello > payload/assets/marker
+        jar cf 'custom outputs/outputs/apk/output.apk' -C payload .
+      """)
+    let project = android(
+      source: src,
+      baseCtr: jdk,
+      gradleModule: "",
+      modulePath: ".",
+      buildDirectory: "custom outputs",
+      sourceExcludes: ["**/.gradle"],
+      requiredApkPaths: ["assets/marker"],
+    )
+    runCheck(project.build)
+    assert(project.assemble.glob("*.apk") == ["output.apk"], "custom build directory failed")
+    assert(
+      project.assemble(outputPath: "custom outputs/outputs/apk").glob("*.apk") == ["output.apk"],
+      "outputPath override failed",
+    )
+    null
+  }
+}

@@ -1,0 +1,26 @@
+[modules.e2e]
+source = ".dagger/modules/e2e"
+
+[modules.dagger-dang-sdk]
+source = "github.com/dagger/dang-sdk@collections"
+
+[env.fixture.modules.android]
+source = "."
+
+[env.fixture.modules.android.settings]
+source = ".dagger/modules/e2e/testdata/android"
+gradleModule = "client"
+modulePath = "apps/client"
+checkVariant = "demoDebug"
+cacheKey = "android-integration"
+
+[sdks.dang]
+module = "dagger-dang-sdk"
+
+[sdks.dang.scopes."."]
+is-module = true
+name = "android"
+
+[sdks.dang.scopes.".dagger/modules/e2e"]
+clients = ["./."]
+is-module = true

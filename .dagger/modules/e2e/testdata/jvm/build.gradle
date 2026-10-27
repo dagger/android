@@ -1,0 +1,19 @@
+plugins {
+    id 'java'
+}
+
+repositories { mavenCentral() }
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+// Exercise the same Gradle Test API used by Android unit-test tasks, natively
+// and without the SDK. The Android fixture separately covers AGP and JUnit 4.
+tasks.register('testDebugUnitTest', Test) {
+    testClassesDirs = sourceSets.test.output.classesDirs
+    classpath = sourceSets.test.runtimeClasspath
+    useJUnitPlatform()
+}

@@ -1,0 +1,44 @@
+import org.gradle.api.GradleException
+import org.gradle.api.tasks.testing.Test
+import org.gradle.util.GradleVersion
+
+// Ask the configured test framework what it discovers. Parsing Java or Kotlin
+// source would miss inherited tests, custom source sets, and generated classes.
+if (GradleVersion.current() < GradleVersion.version('8.3')) {
+    throw new GradleException('Android test collection discovery requires Gradle 8.3 or later. Use the direct test function with older Gradle versions.')
+}
+
+gradle.projectsEvaluated {
+    def taskPath = System.getenv('DAGGER_ANDROID_TEST_TASK')
+    def testTask = rootProject.tasks.getByPath(taskPath)
+    if (!(testTask instanceof Test)) {
+        throw new GradleException("Android test collection discovery requires a Gradle Test task: ${taskPath}")
+    }
+
+    // Initialize even for NO-SOURCE or disabled tasks, so an empty suite is a
+    // valid empty collection. Never inherit output from a previous invocation.
+    def result = new File('/tmp/dagger-android-test-classes.txt')
+    result.text = ''
+    def classes = Collections.synchronizedSortedSet(new TreeSet<String>())
+    def recordClass = { descriptor ->
+        def name = descriptor.className
+        if (name != null && !name.isEmpty()) {
+            // Gradle treats '*' as a filter wildcard, with no literal escape.
+            if (name.contains('*') || name.contains('\n') || name.contains('\r')) {
+                throw new GradleException("Cannot select this test class with a literal Gradle filter: ${name}")
+            }
+            classes.add(name)
+        }
+    }
+
+    testTask.dryRun = true
+    // Discovery must emit events, even when a remote Gradle build cache has
+    // a previous result. These overrides affect only the discovery invocation.
+    testTask.outputs.upToDateWhen { false }
+    testTask.outputs.doNotCacheIf('Dagger test discovery needs test events') { true }
+    testTask.afterSuite { descriptor, outcome -> recordClass(descriptor) }
+    testTask.afterTest { descriptor, outcome -> recordClass(descriptor) }
+    testTask.doLast {
+        result.text = classes.isEmpty() ? '' : classes.join('\n') + '\n'
+    }
+}

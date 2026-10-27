@@ -1,0 +1,1 @@
+Independent Android module fixture.
