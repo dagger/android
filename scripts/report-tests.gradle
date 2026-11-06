@@ -1,0 +1,80 @@
+import groovy.json.JsonOutput
+import org.gradle.api.GradleException
+import org.gradle.api.tasks.testing.Test
+
+// Record what the shared test run did as JSON lines, one event per line, for
+// the module's report indexer. Gradle's own XML and HTML reports are
+// configurable per project; these events are not.
+gradle.projectsEvaluated {
+    def taskPath = System.getenv('DAGGER_ANDROID_TEST_TASK')
+    def testTask = rootProject.tasks.getByPath(taskPath)
+    if (!(testTask instanceof Test)) {
+        throw new GradleException("Android test collection runs require a Gradle Test task: ${taskPath}")
+    }
+
+    // A check must execute its tests: an up-to-date or cached task has no
+    // events to attribute. A selected class that matches nothing is reported
+    // as not run for that class, rather than failing every selected class.
+    testTask.outputs.upToDateWhen { false }
+    testTask.outputs.doNotCacheIf('Dagger test checks need test events') { true }
+    testTask.filter.failOnNoMatchingTests = false
+
+    // Never inherit events from a previous invocation.
+    def report = new File(System.getenv('DAGGER_ANDROID_TEST_REPORT'))
+    report.text = ''
+    def lock = new Object()
+    def write = { Map event ->
+        synchronized (lock) {
+            report.withWriterAppend('UTF-8') { it.write(JsonOutput.toJson(event) + '\n') }
+        }
+    }
+    def failure = { result ->
+        result.exceptions.collect { e ->
+            def text = new StringWriter()
+            e.printStackTrace(new PrintWriter(text))
+            text.toString()
+        }.join('\n')
+    }
+    write([event: 'config', failFast: testTask.failFast])
+
+    // Task failures, in the test task or any other (a finalizer, or any task
+    // under --continue). The indexer separates a test task failing because
+    // tests failed from failures no test class owns.
+    gradle.taskGraph.afterTask { task, state ->
+        if (state.failure != null) {
+            def messages = []
+            for (def e = state.failure; e != null; e = (e.cause == e ? null : e.cause)) {
+                messages << (e.message ?: e.class.name)
+            }
+            write([event: 'task', name: task.path, test: task.path == testTask.path, failure: messages.join('\n> ')])
+        }
+    }
+
+    testTask.beforeSuite { descriptor ->
+        if (descriptor.parent == null) {
+            write([event: 'start'])
+        }
+    }
+    testTask.afterSuite { descriptor, result ->
+        write([
+            event: 'suite',
+            root: descriptor.parent == null,
+            class: descriptor.className,
+            name: descriptor.name,
+            result: result.resultType.name(),
+            failure: failure(result),
+        ])
+    }
+    testTask.afterTest { descriptor, result ->
+        write([
+            event: 'test',
+            class: descriptor.className,
+            name: descriptor.name,
+            result: result.resultType.name(),
+            failure: failure(result),
+        ])
+    }
+    testTask.onOutput { descriptor, output ->
+        write([event: 'output', class: descriptor.className, output: output.message])
+    }
+}
