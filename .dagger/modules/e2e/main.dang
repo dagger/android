@@ -69,12 +69,16 @@ type E2e {
       classes.keys == ["com.example.fixture.ArithmeticTest", "com.example.fixture.ParameterizedTest"],
       "unexpected Android test classes: " + classes.keys.join(", "),
     )
-    runCheck(classes.get(key: "com.example.fixture.ParameterizedTest").test)
+    let parameterized = "com.example.fixture.ParameterizedTest"
+    runCheck(classes.get(key: parameterized).test(selection: classes.subset(keys: [parameterized])))
     null
   }
 
   """
-  JUnit 5 discovery skips test bodies; individual, subset, whole, and empty selections work.
+  JUnit 5 discovery from source, including inherited, parameterized, and
+  dynamic tests; individual, subset, whole, and empty selections work through
+  direct calls. The selected* checks cover the
+  engine's filtered selection through the CLI.
   """
   jvmCollections: Void @check {
     let source = jvmFixture
@@ -92,11 +96,25 @@ type E2e {
       classes.keys == ["com.example.CasesTest", "com.example.FailingTest", "com.example.InheritedTest", "com.example.PassingTest"],
       "unexpected JUnit 5 test classes: " + classes.keys.join(", "),
     )
-    runCheck(classes.get(key: "com.example.PassingTest").test)
-    runCheck(classes.subset(keys: ["com.example.PassingTest", "com.example.CasesTest", "com.example.InheritedTest"]).batch.test)
-    assert(classes.get(key: "com.example.FailingTest").test.pass == false, "selected failing test did not execute")
-    assert(classes.batch.test.pass == false, "whole selection missed the failing test")
-    runCheck(classes.subset(keys: []).batch.test)
+    let passing = "com.example.PassingTest"
+    let failing = "com.example.FailingTest"
+    runCheck(classes.get(key: passing).test(selection: classes.subset(keys: [passing])))
+    classes.subset(keys: [passing, "com.example.CasesTest", "com.example.InheritedTest"]).test
+    assert(
+      classes.get(key: failing).test(selection: classes.subset(keys: [passing, failing])).pass == false,
+      "selected failing test did not execute",
+    )
+    assert(
+      classes.get(key: passing).test(selection: classes.subset(keys: [passing, failing])).pass,
+      "a failing class failed another selected class",
+    )
+    assert(
+      classes.get(key: passing).test(selection: classes.subset(keys: [failing])).pass == false,
+      "a class outside its selection passed",
+    )
+    let whole = { classes.test; "passed" } rescue { err: Error => err.message }
+    assert(whole.contains("fixture failure proves"), "whole selection missed the failing test: " + whole)
+    classes.subset(keys: []).test
 
     let empty = android(
       source: source.withoutDirectory("src/test"),
@@ -107,7 +125,7 @@ type E2e {
       cacheKey: "android-jvm-collections",
     ).tests
     assert(empty.keys == [], "an empty project reported tests")
-    runCheck(empty.batch.test)
+    empty.test
     null
   }
 
@@ -346,6 +364,335 @@ type E2e {
       project.assemble(outputPath: "custom outputs/outputs/apk").glob("*.apk") == ["output.apk"],
       "outputPath override failed",
     )
+    null
+  }
+
+  # Only the unindented CHECKS header counts. Nested TESTS summaries can
+  # report correct test results even when Dagger attributes checks incorrectly.
+  let checkSummaryMatches(output: String!, passed: Int!, failed: Int!): Boolean! {
+    let headers = output.split("\n").filter { line =>
+      line.hasPrefix("CHECKS ") or line.hasPrefix("== CHECKS ==")
+    }
+    let expected = (if (failed > 0) { ["✘", `${failed}`, "failed"] } else { [] })
+      + (if (passed > 0) { ["✔", `${passed}`, "passed"] } else { [] })
+    headers.length == 1 and headers[0]!.trimPrefix("== ").trimPrefix("CHECKS").trimPrefix(" ==")
+      .trimSpace.split(" ").filter { word => word != "" } == expected
+  }
+
+  """
+  The selected* checks' summary parser counts only top-level check totals.
+  """
+  selectedSummaryCheck: Void @check {
+    let wrong = "CHECKS  ✘ 3 failed\n  TESTS\n    ✘ 1 failed\n    ✔ 2 passed\n"
+    assert(checkSummaryMatches(wrong, 2, 1) == false, "nested test counts hid failed checks")
+    assert(checkSummaryMatches(wrong, 0, 3), "zero passing checks were not recognized")
+    assert(checkSummaryMatches("CHECKS  ✔ 13 passed\n", 3, 0) == false, "accepted a partial count")
+    assert(checkSummaryMatches("CHECKS  ✘ 1 failed  ✔ 2 passed\n", 2, 1), "mixed counts were not recognized")
+    assert(checkSummaryMatches("== CHECKS ==  ✔ 3 passed\n", 3, 0), "agent report was not recognized")
+    assert(checkSummaryMatches("  CHECKS  ✔ 3 passed\n", 3, 0) == false, "accepted a nested header")
+    null
+  }
+
+  # Exercise selection through the CLI: direct Dang calls do not apply the
+  # engine's filtered collection view. The engine supplies its matching CLI.
+  let runCli(ws: Workspace!, fixture: Directory!, config: String!, args: [String!]!): Container! {
+    container
+      .from("alpine:3.22.2")
+      .withEnvVariable("NO_COLOR", "1")
+      .withDirectory("/source", ws.directory("/"))
+      .withDirectory("/work", fixture)
+      .withNewFile("/work/.git/HEAD", "ref: refs/heads/main\n")
+      .withNewFile("/work/dagger.toml", config)
+      .withWorkdir("/work")
+      .withExec(["/dev/.dagger/dagger"] + args, expect: ANY, daggerInDaggerNewSession: true)
+  }
+
+  # One installation of the module under test. The JUnit 5 fixtures run on a
+  # plain Gradle image, natively rather than as the SDK's emulated linux/amd64.
+  let moduleConfig(
+    alias: String! = "android",
+    source: String! = ".",
+    settings: String! = "",
+    image: String! = "gradle:8.13-jdk21",
+    gradleCommand: String! = "[\"gradle\"]",
+  ): String! {
+    "[modules." + alias + "]\nsource = \"/source\"\n\n"
+      + "[modules." + alias + ".settings]\n"
+      + "source = \"" + source + "\"\n"
+      + "baseImageAddress = \"" + image + "\"\n"
+      + `platform = "${defaultPlatform}"` + "\n"
+      + "gradleCommand = " + gradleCommand + "\n"
+      + "gradleModule = \"\"\nmodulePath = \".\"\ncacheKey = \"android-jvm-collections\"\n"
+      + settings + "\n"
+  }
+
+  let selectedCheck(
+    ws: Workspace!,
+    fixture: Directory!,
+    args: [String!]!,
+    passed: Int!,
+    failed: Int! = 0,
+    messages: [String!]! = [],
+    config: String! = "",
+  ): Void {
+    let toml = if (config == "") { moduleConfig } else { config }
+    let result = runCli(ws, fixture, toml, ["--progress=report", "check", "--generated=false"] + args)
+    let output = result.stdout + result.stderr
+    assert((result.exitCode == 0) == (failed == 0), "unexpected check exit status:\n" + output)
+    assert(checkSummaryMatches(output, passed, failed), "unexpected Dagger check totals:\n" + output)
+    messages.map { message =>
+      assert(output.contains(message), "missing " + message + ":\n" + output)
+    }
+    null
+  }
+
+  let classArgs(names: [String!]!, alias: String! = "android"): [String!]! {
+    names.map { name => "--" + alias + "-test-class=com.example." + name }
+  }
+
+  # Appends Gradle configuration to the JUnit 5 fixture's build script.
+  let withBuildScript(fixture: Directory!, extra: String!): Directory! {
+    fixture.withNewFile("build.gradle", fixture.file("build.gradle").contents + "\n" + extra + "\n")
+  }
+
+  let withTestClass(fixture: Directory!, name: String!, body: String!, dir: String! = "src/test/java"): Directory! {
+    fixture.withNewFile(
+      dir + "/com/example/" + name + ".java",
+      "package com.example;\nimport org.junit.jupiter.api.*;\npublic class " + name + " {\n" + body + "\n}\n",
+    )
+  }
+
+  """
+  Selected classes run in one Gradle invocation; the excluded failing class does not run.
+  """
+  selectedTestsCheck(ws: Workspace!): Void @check {
+    selectedCheck(ws, jvmFixture, classArgs(["PassingTest", "CasesTest", "InheritedTest"]), passed: 3)
+  }
+
+  """
+  Without class selection, the whole task runs once and only the failing class fails.
+  """
+  selectedWholeCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      jvmFixture,
+      ["--check=test"],
+      passed: 3,
+      failed: 1,
+      messages: ["fixture failure proves selected tests actually execute"],
+    )
+  }
+
+  """
+  A failing selected class fails only its own check.
+  """
+  selectedFailureCheck(ws: Workspace!): Void @check {
+    selectedCheck(
+      ws,
+      jvmFixture,
+      classArgs(["PassingTest", "FailingTest"]),
+      passed: 1,
+      failed: 1,
+      messages: ["fixture failure proves selected tests actually execute"],
+    )
+  }
+
+  """
+  A class setup failure fails only that class.
+  """
+  selectedSetupFailureCheck(ws: Workspace!): Void @check {
+    let fixture = withTestClass(
+      jvmFixture,
+      "SetupTest",
+      "@BeforeAll static void setUp() { throw new IllegalStateException(\"class setup failure\"); }\n@Test void runs() {}",
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      classArgs(["PassingTest", "SetupTest"]),
+      passed: 1,
+      failed: 1,
+      messages: ["class setup failure"],
+    )
+  }
+
+  """
+  A test compilation error fails every selected class; listing is unaffected.
+  """
+  selectedBuildFailureCheck(ws: Workspace!): Void @check {
+    let fixture = withTestClass(jvmFixture, "BrokenTest", "@Test void broken() { undefinedSymbol(); }")
+    selectedCheck(
+      ws,
+      fixture,
+      classArgs(["PassingTest", "CasesTest"]),
+      passed: 0,
+      failed: 2,
+      messages: ["Gradle failed outside the test classes", "task :compileTestJava failed", "Compilation failed"],
+    )
+  }
+
+  """
+  A Gradle failure outside any test class fails every selected class.
+  """
+  selectedTaskFailureCheck(ws: Workspace!): Void @check {
+    let fixture = withBuildScript(jvmFixture, """
+      tasks.named('testDebugUnitTest') {
+          doLast { throw new GradleException('post-test task failure') }
+      }
+    """)
+    selectedCheck(
+      ws,
+      fixture,
+      classArgs(["PassingTest", "CasesTest"]),
+      passed: 0,
+      failed: 2,
+      messages: ["Gradle failed outside the test classes", "post-test task failure"],
+    )
+  }
+
+  """
+  A failing task next to a failing test, here a finalizer under --continue,
+  fails every selected class, not only the failing one.
+  """
+  selectedFinalizerFailureCheck(ws: Workspace!): Void @check {
+    let fixture = withBuildScript(jvmFixture, """
+      tasks.register('brokenFinalizer') {
+          doLast { throw new GradleException('finalizer failure') }
+      }
+      tasks.named('testDebugUnitTest') { finalizedBy 'brokenFinalizer' }
+    """)
+    selectedCheck(
+      ws,
+      fixture,
+      classArgs(["PassingTest", "FailingTest"]),
+      passed: 0,
+      failed: 2,
+      messages: ["task :brokenFinalizer failed", "finalizer failure"],
+      config: moduleConfig(settings: "gradleArguments = [\"--continue\"]"),
+    )
+  }
+
+  """
+  A failing class discovery missed fails every check sharing the whole run, but
+  is not run by a narrowed selection.
+  """
+  selectedUndiscoveredFailureCheck(ws: Workspace!): Void @check {
+    # Discovery reads src/test*; Gradle also compiles this extra directory.
+    let fixture = withTestClass(
+      withBuildScript(
+        jvmFixture.withoutFile("src/test/java/com/example/FailingTest.java"),
+        "sourceSets.test.java.srcDir 'extra-tests'",
+      ),
+      "HiddenTest",
+      "@Test void fails() { Assertions.fail(\"undiscovered failure\"); }",
+      dir: "extra-tests",
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      ["--check=test"],
+      passed: 0,
+      failed: 3,
+      messages: ["failures in test classes without selected checks: com.example.HiddenTest", "undiscovered failure"],
+    )
+    selectedCheck(ws, fixture, classArgs(["PassingTest"]), passed: 1)
+  }
+
+  """
+  A selected class that Gradle does not run fails as not run instead of passing.
+  """
+  selectedNeverRanCheck(ws: Workspace!): Void @check {
+    let fixture = withTestClass(
+      withBuildScript(jvmFixture, "tasks.named('testDebugUnitTest') { exclude '**/GhostTest*' }"),
+      "GhostTest",
+      "@Test void passes() {}",
+    )
+    selectedCheck(
+      ws,
+      fixture,
+      classArgs(["PassingTest", "GhostTest"]),
+      passed: 1,
+      failed: 1,
+      messages: ["com.example.GhostTest did not run"],
+    )
+  }
+
+  # Three classes that fail with the id of the Gradle invocation running them.
+  let runIdFixture(unit: String!): Directory! {
+    let build = jvmFixture.file("build.gradle").contents + """
+
+      tasks.named('testDebugUnitTest') { systemProperty 'dagger.run.id', UUID.randomUUID().toString() }
+    """
+    ["OneTest", "TwoTest", "ThreeTest"].reduce(directory.withNewFile("build.gradle", build)
+      .withFile("gradle.properties", jvmFixture.file("gradle.properties"))
+      .withFile("settings.gradle", jvmFixture.file("settings.gradle"))) { dir, name =>
+      withTestClass(dir, name, "@Test void reports() { Assertions.fail(\"" + unit + "-run=\" + System.getProperty(\"dagger.run.id\")); }")
+    }
+  }
+
+  let failingRun(ws: Workspace!, fixture: Directory!, config: String!, args: [String!]!, failed: Int!): String! {
+    let result = runCli(ws, fixture, config, ["--progress=report", "check", "--generated=false"] + args)
+    let output = result.stdout + result.stderr
+    assert(checkSummaryMatches(output, 0, failed), "unexpected Dagger check totals:\n" + output)
+    output
+  }
+
+  # The distinct Gradle invocation ids that failures report for a unit.
+  let runIds(output: String!, unit: String!): [String!]! {
+    output.split(unit + "-run=").dropFirst(1).map { part => part.split("").takeFirst(36).join("") }.uniq
+  }
+
+  """
+  Each module configuration runs Gradle once for all of its selected classes,
+  and separate configurations run separately.
+  """
+  selectedOneRunPerUnitCheck(ws: Workspace!): Void @check {
+    let fixture = directory
+      .withDirectory("app", runIdFixture("app"))
+      .withDirectory("lib", runIdFixture("lib"))
+    let config = moduleConfig(alias: "app", source: "app") + "\n" + moduleConfig(alias: "lib", source: "lib")
+    let whole = failingRun(ws, fixture, config, ["--check=test"], 6)
+    let app = runIds(whole, "app")
+    let lib = runIds(whole, "lib")
+    assert(app.length == 1, "app's classes ran in " + `${app.length}` + " Gradle invocations:\n" + whole)
+    assert(lib.length == 1, "lib's classes ran in " + `${lib.length}` + " Gradle invocations:\n" + whole)
+    assert(app != lib, "two configurations shared one Gradle invocation:\n" + whole)
+    let narrowed = failingRun(ws, fixture, config, classArgs(["OneTest", "ThreeTest"], alias: "app"), 2)
+    let ids = runIds(narrowed, "app")
+    assert(ids.length == 1, "a narrowed selection ran in " + `${ids.length}` + " Gradle invocations:\n" + narrowed)
+    assert(runIds(narrowed, "lib") == [], "an unselected configuration ran:\n" + narrowed)
+    null
+  }
+
+  """
+  Listing runs no Gradle and no project container: classes still list when the
+  build script is broken, Gradle is missing, and the SDK image does not exist.
+  """
+  listingRunsNoToolCheck(ws: Workspace!): Void @check {
+    let fixture = jvmFixture.withNewFile("build.gradle", "this is not a Gradle build {\n")
+    let config = moduleConfig(image: "registry.invalid/no-such-sdk:0", gradleCommand: "[\"false\"]")
+    let result = runCli(ws, fixture, config, ["--progress=plain", "check", "-l", "-a"])
+    let output = result.stdout + result.stderr
+    assert(result.exitCode == 0, "listing failed:\n" + output)
+    ["CasesTest", "FailingTest", "InheritedTest", "PassingTest"].map { name =>
+      assert(output.contains("com.example." + name), "listing missed " + name + ":\n" + output)
+    }
+    assert(output.contains("AbstractTest") == false, "listing included an abstract class:\n" + output)
+    null
+  }
+
+  """
+  The test helper's unit tests: source discovery and report indexing.
+  """
+  testHelper(ws: Workspace!): Void @check {
+    container
+      .from("golang:1.25.4-alpine3.22")
+      .withDirectory("/src", ws.directory("/helpers/android-tests"))
+      .withWorkdir("/src")
+      .withEnvVariable("CGO_ENABLED", "0")
+      .withExec(["go", "vet", "./..."])
+      .withExec(["go", "test", "./..."])
+      .sync
     null
   }
 }

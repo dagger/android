@@ -276,9 +276,9 @@ type Android {
   }
 
   """
-  Run all JVM unit tests directly, without collection discovery. The test check
-  is exposed through tests so selecting collection items does not also run the
-  entire suite.
+  Run all JVM unit tests directly, without collection discovery. The test
+  checks are exposed per class through tests, so selecting classes does not
+  also run the entire suite.
   """
   test: Void {
     run([task("test", checkVariant, "UnitTest")]).sync
@@ -286,24 +286,81 @@ type Android {
   }
 
   """
-  Discover JVM test classes for checkVariant using Gradle's test dry-run mode.
-  Requires Gradle 8.3 or later. Discovery compiles test sources and loads the
-  test framework, but does not execute test bodies. Device tests are excluded.
+  JVM test classes for checkVariant, discovered from Java and Kotlin sources in
+  the module's unit-test source sets (src/test and src/test<Variant part>).
+  Listing runs no Gradle, JDK, or SDK container: one pinned, source-only scan
+  reads the test sources. Device tests are excluded.
   """
   tests: TestClasses! {
-    let testTask = task("test", checkVariant, "UnitTest")
-    let discovery = base
-      .withFile("/opt/dagger-android/discover-tests.gradle", currentModule.source.file("scripts/discover-tests.gradle"))
-      .withEnvVariable("DAGGER_ANDROID_TEST_TASK", testTask)
-      .withExec(command([testTask], [
-        "--init-script", "/opt/dagger-android/discover-tests.gradle",
-        "--no-configuration-cache", "--test-dry-run",
-      ]))
-    TestClasses(
-      names: discovery.file("/tmp/dagger-android-test-classes.txt").contents.split("\n").filter { name => name != "" },
-      prepared: discovery,
-      command: command([testTask]),
-    )
+    TestClasses(names: testClassNames, tool: self)
+  }
+
+  # The module directory, relative to the context, with a trailing slash.
+  let modulePrefix: String! {
+    [relativePath(projectPath), relativePath(modulePath)]
+      .filter { part => part != "." }
+      .map { part => part + "/" }
+      .join("")
+  }
+
+  let testClassNames: [String!]! {
+    let src = modulePrefix + "src"
+    testHelperContainer
+      .withDirectory("/scan", context, include: [src + "/test*/**/*.java", src + "/test*/**/*.kt"])
+      .withExec(["android-tests", "discover", "--root", "/scan/" + src], redirectStdout: "/classes.tsv")
+      .file("/classes.tsv")
+      .contents
+      .split("\n")
+      .filter { line => line != "" and variantSourceSet(line.split("\t")[1] ?? "") }
+      .map { line => line.split("\t")[0]! }
+      .uniq
+  }
+
+  # Unit-test source sets apply to a variant when their suffix is a run of
+  # whole words of it: testDemo, testDebug and testDemoDebug for demoDebug.
+  let variantSourceSet(name: String!): Boolean! {
+    let suffix = name.trimPrefix("test")
+    if (suffix == "") {
+      name == "test"
+    } else {
+      let first = suffix.split("")[0] ?? ""
+      let variantFirst = checkVariant.split("")[0] ?? ""
+      let words = variantFirst.toUpper + checkVariant.trimPrefix(variantFirst) + "!"
+      first != first.toLower and (["!"] + "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("")).any { next =>
+        words.contains(suffix + next)
+      }
+    }
+  }
+
+  # Exact, pinned image for the module's own helper, independent of the
+  # project's toolchain.
+  let testHelperImage: String! { "golang:1.25.4-alpine3.22" }
+
+  # Discovers test classes from source and indexes shared run events. Built
+  # once: its inputs are the pinned image and this module's helper source.
+  let testHelperContainer: Container! {
+    container
+      .from(testHelperImage)
+      .withDirectory("/src/android-tests", currentModule.source.directory("helpers/android-tests"))
+      .withWorkdir("/src/android-tests")
+      .withEnvVariable("CGO_ENABLED", "0")
+      .withExec(["go", "build", "-trimpath", "-o", "/usr/local/bin/android-tests", "."])
+      .withWorkdir("/")
+  }
+
+  # The container and command every selected class check shares, before any
+  # --tests filters. Only a run builds them; listing never does.
+  let testRunner: Container! {
+    base
+      .withFile("/opt/dagger-android/report-tests.gradle", currentModule.source.file("scripts/report-tests.gradle"))
+      .withEnvVariable("DAGGER_ANDROID_TEST_TASK", task("test", checkVariant, "UnitTest"))
+      .withEnvVariable("DAGGER_ANDROID_TEST_REPORT", "/tmp/dagger-android-test-events.jsonl")
+  }
+
+  let testCommand: [String!]! {
+    command([task("test", checkVariant, "UnitTest")], [
+      "--init-script", "/opt/dagger-android/report-tests.gradle", "--no-configuration-cache",
+    ])
   }
 
   """
@@ -370,36 +427,101 @@ type TestClasses @collection {
   """
   Changes to the discovered selection.
   """
-  delta: CollectionDelta
+  delta: CollectionDelta @delta
 
-  let prepared: Container!
-  let command: [String!]!
+  """
+  Whether the active selection removed test classes from this collection.
+  """
+  narrowed: Boolean! { delta == null or delta!.removedKeys.length > 0 }
+
+  let tool: Android!
 
   """
   Select one test class.
   """
   testClass(name: String!): TestClass! @get {
-    TestClass(name: name, prepared: prepared, command: command)
+    TestClass(name: name)
   }
 
   """
-  Run selected test classes in one Gradle invocation, reusing compiled tests.
-  An unchanged selection runs the whole suite with Gradle's own configuration.
+  Run these test classes in one Gradle invocation and fail if any failed. This
+  is a plain function, not a check: dagger check runs each class's own check,
+  and those share a single Gradle invocation.
   """
-  test: Void @check {
+  test: Void {
     if (names != []) {
-      let whole = if (delta == null) {
-        false
-      } else {
-        delta.addedKeys.length == 0 and delta.removedKeys.length == 0
-      }
-      let empty: [String!]! = []
-      let filters = if (whole) { empty } else {
-        names.reduce(empty) { args, name => args + ["--tests", name] }
-      }
-      prepared.withExec(command + filters + ["--no-test-dry-run"]).sync
+      let shared = results
+      let failures = names.map { name =>
+        { shared.assertPassed(name); "" } rescue { err: Error => err.message }
+      }.filter { failure => failure != "" }
+      if (failures != []) { raise failures.join("\n") }
     }
     null
+  }
+
+  """
+  One Gradle command and report shared by every selected test class.
+
+  It depends only on this collection, never on the class asking, so every
+  selected class check builds a byte-identical command and the engine runs it
+  once. An unnarrowed selection runs the task with Gradle's own configuration;
+  otherwise each selected class becomes a --tests filter, in byte order.
+  """
+  let results: TestResults! {
+    if (names.length == 0) { raise "no test classes selected" }
+    let empty: [String!]! = []
+    let filters = if (narrowed) {
+      sorted(names).reduce(empty) { args, name => args + ["--tests", name] }
+    } else { empty }
+    # Never let the shared command raise: that would fail every class with the
+    # same message. The indexer attributes Gradle's exit status instead.
+    let executed = tool.testRunner.withExec(
+      tool.testCommand + filters,
+      expect: ANY,
+      redirectStderr: "/tmp/dagger-android-gradle-stderr.log",
+    )
+    let indexed = tool.testHelperContainer
+      .withDirectory(
+        "/report",
+        executed.directory("/tmp"),
+        include: ["dagger-android-test-events.jsonl", "dagger-android-gradle-stderr.log"],
+      )
+      .withNewFile("/report/selection.json", JSON.encode(names))
+      .withExec([
+        "android-tests", "index",
+        "--report", "/report/dagger-android-test-events.jsonl",
+        "--stderr", "/report/dagger-android-gradle-stderr.log",
+        "--selection", "/report/selection.json",
+        "--exit-code", `${executed.exitCode}`,
+        "--output", "/results",
+      ])
+    TestResults(results: indexed.directory("/results"), names: names)
+  }
+
+  # Byte order, matching the indexer's sort.Strings.
+  let sorted(items: [String!]!): [String!]! {
+    if (items.length < 2) {
+      items
+    } else {
+      let half = items.length / 2
+      mergeSorted(sorted(items.takeFirst(half)), sorted(items.dropFirst(half)))
+    }
+  }
+
+  let mergeSorted(a: [String!]!, b: [String!]!): [String!]! {
+    let i = 0
+    let j = 0
+    (a + b).map { unused =>
+      if (j == b.length or (i < a.length and a[i]! <= b[j]!)) {
+        let item = a[i]!
+        i += 1
+        item
+      } else {
+        let item = b[j]!
+        j += 1
+        item
+      }
+    }
   }
 }
 
@@ -412,14 +534,27 @@ type TestClass {
   """
   name: String!
 
-  let prepared: Container!
-  let command: [String!]!
+  """
+  Run this class's tests. The engine passes the selected test classes, so
+  every selected class shares one Gradle invocation and reads only its own
+  result from it.
+  """
+  test(selection: TestClasses!): Void @check {
+    selection.results.assertPassed(name)
+  }
+}
 
-  """
-  Run this class using Gradle's test filter, reusing compiled tests.
-  """
-  test: Void @check {
-    prepared.withExec(command + ["--tests", name, "--no-test-dry-run"]).sync
+# The indexer's bounded results, one file per selected class.
+type TestResults {
+  let results: Directory!
+  let names: [String!]!
+
+  let assertPassed(name: String!): Void {
+    if (names.contains(name) == false) { raise "test class is outside the selection: " + name }
+    # Numeric byte-order ranks keep class names out of file paths.
+    let rank = names.filter { other => other < name }.length
+    let failure = results.file(`${rank}`).contents
+    if (failure != "") { raise failure }
     null
   }
 }
